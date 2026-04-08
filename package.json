@@ -1,0 +1,21 @@
+{
+  "name": "cordova-plugin-ts-native-player",
+  "version": "1.1.0",
+  "description": "Cordova iOS plugin for native playback of remote dashcam TS files using MobileVLCKit",
+  "cordova": {
+    "id": "cordova-plugin-ts-native-player",
+    "platforms": [
+      "ios"
+    ]
+  },
+  "keywords": [
+    "cordova",
+    "ios",
+    "dashcam",
+    "ts",
+    "vlc",
+    "mpeg-ts"
+  ],
+  "author": "OpenAI",
+  "license": "MIT"
+}

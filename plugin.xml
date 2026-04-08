@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
+        xmlns:ios="http://apple.com/ios/plugins"
+        id="cordova-plugin-ts-native-player"
+        version="1.1.0">
+
+    <name>TSNativePlayer</name>
+    <description>Native iOS playback for remote dashcam .TS files using MobileVLCKit and native temp-file download.</description>
+    <license>MIT</license>
+    <keywords>cordova,ios,dashcam,ts,vlc,mpeg-ts</keywords>
+
+    <js-module src="www/TsNativePlayer.js" name="TsNativePlayer">
+        <clobbers target="TSNativePlayer" />
+        <clobbers target="window.TSNativePlayer" />
+    </js-module>
+
+    <platform name="ios">
+        <framework src="UIKit.framework" />
+        <podspec>
+            <pods>
+                <pod name="MobileVLCKit" />
+            </pods>
+        </podspec>
+
+        <header-file src="src/ios/TsNativePlayerPlugin.h" />
+        <header-file src="src/ios/TsPlaybackManager.h" />
+        <header-file src="src/ios/TsPlayerViewController.h" />
+
+        <source-file src="src/ios/TsNativePlayerPlugin.m" />
+        <source-file src="src/ios/TsPlaybackManager.m" />
+        <source-file src="src/ios/TsPlayerViewController.m" />
+
+        <config-file target="config.xml" parent="/*">
+            <feature name="TsNativePlayer">
+                <param name="ios-package" value="TsNativePlayerPlugin" />
+            </feature>
+        </config-file>
+
+        
+    </platform>
+</plugin>
