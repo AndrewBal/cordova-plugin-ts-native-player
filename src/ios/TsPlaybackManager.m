@@ -44,6 +44,8 @@
     return sharedInstance;
 }
 
+#pragma mark - Inline Playback
+
 - (void)startInlinePlaybackWithURLString:(NSString *)urlString
                                  options:(NSDictionary *)options
                                presenter:(UIViewController *)presenter
@@ -51,7 +53,8 @@
                                    frame:(CGRect)domFrame
                                   status:(TsPlaybackStatusBlock)status
                                    error:(TsPlaybackErrorBlock)error {
-    [self resetActivePlaybackStatePreservingBlocks:NO];
+    // FIX: force teardown of any previous playback first (synchronous, on main thread)
+    [self forceImmediateTeardown];
 
     self.statusBlock = status;
     self.errorBlock = error;
@@ -89,6 +92,11 @@
                                webView:(UIView *)webView
                               domFrame:(CGRect)domFrame {
     dispatch_async(dispatch_get_main_queue(), ^{
+        // FIX: re-check isStopping after dispatch (might have been stopped before this block runs)
+        if (self.isStopping) {
+            return;
+        }
+
         UIViewController *host = [self topMostPresenterFrom:presenter];
         if (!host || !webView) {
             [self sendError:@"Cannot mount inline player"];
@@ -107,6 +115,9 @@
         self.playerViewController.view.frame = nativeFrame;
         self.playerViewController.view.clipsToBounds = YES;
         self.playerViewController.view.layer.cornerRadius = 12.0;
+
+        // FIX: tag the view so we can find-and-kill orphans if needed
+        self.playerViewController.view.tag = 9999;
 
         [host addChildViewController:self.playerViewController];
         [host.view addSubview:self.playerViewController.view];
@@ -216,16 +227,18 @@
 }
 
 - (void)dealloc {
-    [self invalidateSession];
-    [self teardownMediaPlayer];
+    [self forceImmediateTeardown];
 }
+
+#pragma mark - Fullscreen Playback
 
 - (void)startPlaybackWithURLString:(NSString *)urlString
                            options:(NSDictionary *)options
                          presenter:(UIViewController *)presenter
                             status:(TsPlaybackStatusBlock)statusBlock
                              error:(TsPlaybackErrorBlock)errorBlock {
-    [self resetActivePlaybackStatePreservingBlocks:NO];
+    // FIX: force teardown first
+    [self forceImmediateTeardown];
 
     self.statusBlock = statusBlock;
     self.errorBlock = errorBlock;
@@ -239,16 +252,14 @@
     self.wasPlayingBeforeSeek = NO;
     self.didFallbackToDownload = NO;
 
-    // по умолчанию пробуем direct remote playback
     self.useDirectRemotePlayback = ![options objectForKey:@"forceDownloadFirst"];
-    
+
     NSURL *remoteURL = [NSURL URLWithString:urlString ?: @""];
     if (!remoteURL || !remoteURL.scheme || !remoteURL.host) {
         [self sendError:@"Invalid URL"];
         return;
     }
 
-    // только для http/https
     BOOL isHTTP = [[remoteURL.scheme lowercaseString] isEqualToString:@"http"] ||
                   [[remoteURL.scheme lowercaseString] isEqualToString:@"https"];
 
@@ -350,13 +361,9 @@
             strongSelf.mediaPlayer.drawable = [strongSelf.playerViewController videoContainerView];
 
             VLCMedia *media = [VLCMedia mediaWithURL:remoteURL];
-
-            // Пробуем уменьшить стартовую буферизацию.
-            // Для сетевого ресурса используем network-caching в миллисекундах.
             [media addOption:@":network-caching=500"];
             [media addOption:@":clock-jitter=0"];
             [media addOption:@":clock-synchro=0"];
-
             strongSelf.mediaPlayer.media = media;
 
             [strongSelf sendStatus:@{
@@ -370,6 +377,9 @@
         }];
     });
 }
+
+#pragma mark - Startup Fallback Timer
+
 - (void)startRemoteStartupFallbackTimerWithPresenter:(UIViewController *)presenter remoteURL:(NSURL *)remoteURL {
     [self invalidateStartupFallbackTimer];
 
@@ -378,26 +388,16 @@
                                                                 repeats:NO
                                                                   block:^(NSTimer * _Nonnull timer) {
         TsPlaybackManager *strongSelf = weakSelf;
-        if (!strongSelf || strongSelf.isStopping) {
-            return;
-        }
-
-        if (strongSelf.hasStartedPlayback) {
-            return;
-        }
-
-        if (strongSelf.didFallbackToDownload) {
-            return;
-        }
+        if (!strongSelf || strongSelf.isStopping) return;
+        if (strongSelf.hasStartedPlayback) return;
+        if (strongSelf.didFallbackToDownload) return;
 
         strongSelf.didFallbackToDownload = YES;
 
         [strongSelf teardownMediaPlayer];
         [strongSelf.playerViewController setLoadingVisible:YES];
 
-        [strongSelf sendStatus:@{
-            @"status": @"FALLBACK_TO_DOWNLOAD"
-        } keepCallback:YES];
+        [strongSelf sendStatus:@{ @"status": @"FALLBACK_TO_DOWNLOAD" } keepCallback:YES];
 
         [strongSelf startDownloadPlaybackFromRemoteURL:remoteURL
                                              presenter:presenter
@@ -409,6 +409,9 @@
     [self.startupFallbackTimer invalidate];
     self.startupFallbackTimer = nil;
 }
+
+#pragma mark - Download Playback
+
 - (void)startDownloadPlaybackFromRemoteURL:(NSURL *)remoteURL
                                  presenter:(UIViewController *)presenter
                          originalURLString:(NSString *)urlString {
@@ -447,13 +450,8 @@
                                                                 NSURLResponse * _Nullable response,
                                                                 NSError * _Nullable error) {
         TsPlaybackManager *strongSelf = weakSelf;
-        if (!strongSelf) {
-            return;
-        }
-
-        if (strongSelf.isStopping) {
-            return;
-        }
+        if (!strongSelf) return;
+        if (strongSelf.isStopping) return;
 
         if (error) {
             if (error.code == NSURLErrorCancelled) {
@@ -496,19 +494,107 @@
 
     [self.downloadTask resume];
 }
+
+#pragma mark - Stop / Cleanup
+
+// ──────────────────────────────────────────────
+// FIX: New method — guaranteed synchronous teardown.
+// Removes all native views, stops VLC, clears state.
+// Safe to call from any thread (dispatches to main if needed).
+// ──────────────────────────────────────────────
+- (void)forceImmediateTeardown {
+    [self invalidateStartupFallbackTimer];
+
+    // Cancel network
+    if (self.downloadTask) {
+        [self.downloadTask cancel];
+        self.downloadTask = nil;
+    }
+    [self invalidateSession];
+
+    // Stop VLC
+    if (self.mediaPlayer) {
+        self.mediaPlayer.delegate = nil;
+        self.mediaPlayer.drawable = nil;
+        [self.mediaPlayer stop];
+        self.mediaPlayer = nil;
+    }
+
+    // Remove native view — must happen on main thread, synchronously
+    TsPlayerViewController *playerVC = self.playerViewController;
+    if (playerVC) {
+        // Null out callbacks first to prevent re-entry
+        playerVC.onClose = nil;
+        playerVC.onPlayPauseTapped = nil;
+        playerVC.onSeekStarted = nil;
+        playerVC.onSeekChanged = nil;
+        playerVC.onSeekEnded = nil;
+
+        void (^removeBlock)(void) = ^{
+            [playerVC invalidateAutoHideTimer];
+
+            // Remove as child view controller (inline mode)
+            if (playerVC.parentViewController) {
+                [playerVC willMoveToParentViewController:nil];
+                [playerVC.view removeFromSuperview];
+                [playerVC removeFromParentViewController];
+            }
+
+            // Also remove view from superview if it's still there
+            if (playerVC.view.superview) {
+                [playerVC.view removeFromSuperview];
+            }
+
+            // Dismiss if presented modally (fullscreen mode)
+            if (playerVC.presentingViewController) {
+                [playerVC dismissViewControllerAnimated:NO completion:nil];
+            }
+        };
+
+        if ([NSThread isMainThread]) {
+            removeBlock();
+        } else {
+            dispatch_sync(dispatch_get_main_queue(), removeBlock);
+        }
+
+        self.playerViewController = nil;
+    }
+
+    // Delete temp file if needed
+    if (self.deleteAfterPlayback && self.currentFilePath.length) {
+        [[NSFileManager defaultManager] removeItemAtPath:self.currentFilePath error:nil];
+    }
+
+    // Reset all state
+    self.currentFilePath = nil;
+    self.currentTitle = nil;
+    self.currentRemoteURLString = nil;
+    self.isStopping = NO;
+    self.hasStartedPlayback = NO;
+    self.isUserSeeking = NO;
+    self.wasPlayingBeforeSeek = NO;
+    self.didFallbackToDownload = NO;
+    self.useDirectRemotePlayback = NO;
+    self.isInlineMode = NO;
+    self.inlinePresenter = nil;
+    self.inlineWebView = nil;
+}
+
 - (void)stopPlayback {
     if (self.isStopping) {
         return;
     }
-
     self.isStopping = YES;
+
     [self invalidateStartupFallbackTimer];
 
+    // Cancel download
     if (self.downloadTask) {
         [self.downloadTask cancel];
         self.downloadTask = nil;
     }
 
+    // Stop VLC immediately
     if (self.mediaPlayer) {
         self.mediaPlayer.delegate = nil;
         self.mediaPlayer.drawable = nil;
@@ -517,21 +603,24 @@
     }
 
     if (self.isInlineMode) {
-        [self removeInlinePlayerViewIfNeeded];
+        // FIX: synchronous removal on main thread, then reset
+        [self removeInlinePlayerViewSynchronously];
         [self sendClosedIfNeeded];
-        [self resetActivePlaybackStatePreservingBlocks:NO];
+        [self resetStateAfterStop];
         return;
     }
 
+    // Fullscreen mode: dismiss modal
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (self.playerViewController.presentingViewController) {
-            [self.playerViewController dismissViewControllerAnimated:YES completion:^{
+        TsPlayerViewController *playerVC = self.playerViewController;
+        if (playerVC && playerVC.presentingViewController) {
+            [playerVC dismissViewControllerAnimated:YES completion:^{
                 [self sendClosedIfNeeded];
-                [self resetActivePlaybackStatePreservingBlocks:NO];
+                [self resetStateAfterStop];
             }];
         } else {
             [self sendClosedIfNeeded];
-            [self resetActivePlaybackStatePreservingBlocks:NO];
+            [self resetStateAfterStop];
         }
     });
 }
@@ -551,6 +640,68 @@
 
 - (void)cleanup {
     [self cleanupAllFiles];
+}
+
+#pragma mark - View Removal Helpers
+
+// FIX: New robust synchronous removal for inline player
+- (void)removeInlinePlayerViewSynchronously {
+    TsPlayerViewController *playerVC = self.playerViewController;
+    if (!playerVC) return;
+
+    void (^removeBlock)(void) = ^{
+        // Null out callbacks to prevent re-entry from any pending events
+        playerVC.onClose = nil;
+        playerVC.onPlayPauseTapped = nil;
+        playerVC.onSeekStarted = nil;
+        playerVC.onSeekChanged = nil;
+        playerVC.onSeekEnded = nil;
+
+        [playerVC invalidateAutoHideTimer];
+
+        // Remove from parent VC hierarchy
+        if (playerVC.parentViewController) {
+            [playerVC willMoveToParentViewController:nil];
+            [playerVC.view removeFromSuperview];
+            [playerVC removeFromParentViewController];
+        } else if (playerVC.view.superview) {
+            // Orphan view — remove directly
+            [playerVC.view removeFromSuperview];
+        }
+    };
+
+    if ([NSThread isMainThread]) {
+        removeBlock();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), removeBlock);
+    }
+}
+
+// FIX: Renamed from resetActivePlaybackStatePreservingBlocks to be clearer
+- (void)resetStateAfterStop {
+    // Remove temp file if needed
+    if (self.deleteAfterPlayback && self.currentFilePath.length) {
+        [[NSFileManager defaultManager] removeItemAtPath:self.currentFilePath error:nil];
+    }
+
+    self.playerViewController = nil;
+    self.currentFilePath = nil;
+    self.currentTitle = nil;
+    self.currentRemoteURLString = nil;
+
+    self.isStopping = NO;
+    self.hasStartedPlayback = NO;
+    self.isUserSeeking = NO;
+    self.wasPlayingBeforeSeek = NO;
+    self.didFallbackToDownload = NO;
+    self.useDirectRemotePlayback = NO;
+
+    self.isInlineMode = NO;
+    self.inlinePresenter = nil;
+    self.inlineWebView = nil;
+
+    self.statusBlock = nil;
+    self.errorBlock = nil;
 }
 
 #pragma mark - Download helpers
@@ -593,7 +744,7 @@
     return [NSTemporaryDirectory() stringByAppendingPathComponent:@"TsNativePlayer"];
 }
 
-#pragma mark - Player
+#pragma mark - Local File Player
 
 - (void)presentPlayerForLocalFilePath:(NSString *)filePath presenter:(UIViewController *)presenter {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -615,17 +766,13 @@
 
         self.playerViewController.onClose = ^{
             TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf) {
-                return;
-            }
+            if (!strongSelf) return;
             [strongSelf stopPlayback];
         };
 
         self.playerViewController.onPlayPauseTapped = ^{
             TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.mediaPlayer) {
-                return;
-            }
+            if (!strongSelf || !strongSelf.mediaPlayer) return;
 
             if (strongSelf.mediaPlayer.isPlaying) {
                 [strongSelf.mediaPlayer pause];
@@ -643,18 +790,14 @@
 
         self.playerViewController.onSeekStarted = ^{
             TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.mediaPlayer) {
-                return;
-            }
+            if (!strongSelf || !strongSelf.mediaPlayer) return;
             strongSelf.isUserSeeking = YES;
             strongSelf.wasPlayingBeforeSeek = strongSelf.mediaPlayer.isPlaying;
         };
 
         self.playerViewController.onSeekChanged = ^(float position) {
             TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.mediaPlayer) {
-                return;
-            }
+            if (!strongSelf || !strongSelf.mediaPlayer) return;
 
             NSString *current = [strongSelf stringForApproximateTimeAtPosition:position];
             NSString *duration = [strongSelf stringForMediaLength];
@@ -663,9 +806,7 @@
 
         self.playerViewController.onSeekEnded = ^(float position) {
             TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf || !strongSelf.mediaPlayer) {
-                return;
-            }
+            if (!strongSelf || !strongSelf.mediaPlayer) return;
 
             strongSelf.mediaPlayer.position = position;
             strongSelf.isUserSeeking = NO;
@@ -683,9 +824,7 @@
 
         [topPresenter presentViewController:self.playerViewController animated:YES completion:^{
             TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf) {
-                return;
-            }
+            if (!strongSelf) return;
 
             strongSelf.mediaPlayer = [[VLCMediaPlayer alloc] init];
             strongSelf.mediaPlayer.delegate = strongSelf;
@@ -721,9 +860,7 @@
                         }
                     }
                 }
-                if (keyWindow) {
-                    break;
-                }
+                if (keyWindow) break;
             }
         } else {
             keyWindow = [UIApplication sharedApplication].keyWindow;
@@ -736,24 +873,6 @@
     }
 
     return top;
-}
-
-- (void)dismissPlayerAndFinalize {
-    if (self.playerViewController.presentingViewController) {
-        self.isStopping = YES;
-        __weak TsPlaybackManager *weakSelf = self;
-        [self.playerViewController dismissViewControllerAnimated:YES completion:^{
-            TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf) {
-                return;
-            }
-            [strongSelf sendClosedIfNeeded];
-            [strongSelf resetActivePlaybackStatePreservingBlocks:NO];
-        }];
-    } else {
-        [self sendClosedIfNeeded];
-        [self resetActivePlaybackStatePreservingBlocks:NO];
-    }
 }
 
 - (void)teardownMediaPlayer {
@@ -773,6 +892,11 @@
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        // FIX: double-check after dispatch — state may have changed
+        if (!self.mediaPlayer || self.isStopping) {
+            return;
+        }
+
         switch (self.mediaPlayer.state) {
             case VLCMediaPlayerStateOpening:
                 [self.playerViewController setLoadingVisible:!self.hasStartedPlayback];
@@ -854,6 +978,8 @@
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.mediaPlayer || self.isStopping) return;
+
         NSString *current = [self stringForCurrentPlaybackTime];
         NSString *duration = [self stringForMediaLength];
         [self.playerViewController updatePlaybackTime:current duration:duration];
@@ -904,92 +1030,12 @@
     return [NSString stringWithFormat:@"%02d:%02d", minutes, secs];
 }
 
-#pragma mark - Cleanup helpers
+#pragma mark - Session helpers
 
 - (void)invalidateSession {
     if (self.session) {
         [self.session invalidateAndCancel];
         self.session = nil;
-    }
-}
-
-- (void)dismissPresentedPlayerIfNeededWithCompletion:(void (^)(void))completion {
-    if (self.playerViewController.presentingViewController) {
-        __weak TsPlaybackManager *weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            TsPlaybackManager *strongSelf = weakSelf;
-            if (!strongSelf) {
-                if (completion) {
-                    completion();
-                }
-                return;
-            }
-
-            strongSelf.isStopping = YES;
-            [strongSelf.playerViewController dismissViewControllerAnimated:YES completion:^{
-                if (completion) {
-                    completion();
-                }
-            }];
-        });
-    } else {
-        if (completion) {
-            completion();
-        }
-    }
-}
-
-- (void)resetActivePlaybackStatePreservingBlocks:(BOOL)preserveBlocks {
-    [self invalidateStartupFallbackTimer];
-
-    if (self.downloadTask) {
-        [self.downloadTask cancel];
-        self.downloadTask = nil;
-    }
-
-    [self invalidateSession];
-
-    if (self.mediaPlayer) {
-        self.mediaPlayer.delegate = nil;
-        self.mediaPlayer.drawable = nil;
-        [self.mediaPlayer stop];
-        self.mediaPlayer = nil;
-    }
-
-    if (self.playerViewController) {
-        self.playerViewController.onClose = nil;
-        self.playerViewController.onPlayPauseTapped = nil;
-        self.playerViewController.onSeekStarted = nil;
-        self.playerViewController.onSeekChanged = nil;
-        self.playerViewController.onSeekEnded = nil;
-
-        [self removeInlinePlayerViewIfNeeded];
-        [self.playerViewController invalidateAutoHideTimer];
-        self.playerViewController = nil;
-    }
-
-    if (self.deleteAfterPlayback && self.currentFilePath.length) {
-        [[NSFileManager defaultManager] removeItemAtPath:self.currentFilePath error:nil];
-    }
-
-    self.currentFilePath = nil;
-    self.currentTitle = nil;
-    self.currentRemoteURLString = nil;
-
-    self.isStopping = NO;
-    self.hasStartedPlayback = NO;
-    self.isUserSeeking = NO;
-    self.wasPlayingBeforeSeek = NO;
-    self.didFallbackToDownload = NO;
-    self.useDirectRemotePlayback = NO;
-
-    self.isInlineMode = NO;
-    self.inlinePresenter = nil;
-    self.inlineWebView = nil;
-
-    if (!preserveBlocks) {
-        self.statusBlock = nil;
-        self.errorBlock = nil;
     }
 }
 
@@ -1002,18 +1048,15 @@
 }
 
 - (void)sendError:(NSString *)message {
-    if (self.errorBlock) {
-        self.errorBlock(message ?: @"Unknown error");
-    }
+    TsPlaybackErrorBlock errorBlock = self.errorBlock;
 
-    __weak TsPlaybackManager *weakSelf = self;
-    [self dismissPresentedPlayerIfNeededWithCompletion:^{
-        TsPlaybackManager *strongSelf = weakSelf;
-        if (!strongSelf) {
-            return;
-        }
-        [strongSelf resetActivePlaybackStatePreservingBlocks:NO];
-    }];
+    // FIX: tear down first, THEN call error block
+    // (prevents re-entry issues if error block triggers another play)
+    [self forceImmediateTeardown];
+
+    if (errorBlock) {
+        errorBlock(message ?: @"Unknown error");
+    }
 }
 
 - (void)sendClosedIfNeeded {
@@ -1023,31 +1066,6 @@
 
     self.didSendClosed = YES;
     [self sendStatus:@{ @"status": @"CLOSED" } keepCallback:NO];
-}
-
-- (void)removeInlinePlayerViewIfNeeded {
-    TsPlayerViewController *playerVC = self.playerViewController;
-    if (!playerVC) {
-        return;
-    }
-
-    void (^removeBlock)(void) = ^{
-        [playerVC invalidateAutoHideTimer];
-
-        if (playerVC.parentViewController) {
-            [playerVC willMoveToParentViewController:nil];
-            [playerVC.view removeFromSuperview];
-            [playerVC removeFromParentViewController];
-        } else if (playerVC.view.superview) {
-            [playerVC.view removeFromSuperview];
-        }
-    };
-
-    if ([NSThread isMainThread]) {
-        removeBlock();
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), removeBlock);
-    }
 }
 
 @end

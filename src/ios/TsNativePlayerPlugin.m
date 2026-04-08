@@ -3,16 +3,30 @@
 
 @interface TsNativePlayerPlugin ()
 
-@property (nonatomic, strong) TsPlaybackManager *playbackManager;
 @property (nonatomic, copy, nullable) NSString *activeCallbackId;
 
 @end
 
 @implementation TsNativePlayerPlugin
 
+// ──────────────────────────────────────────────
+// FIX: Use [TsPlaybackManager sharedManager] everywhere.
+//
+// Previously pluginInitialize created a SEPARATE instance:
+//   self.playbackManager = [[TsPlaybackManager alloc] init];
+//
+// But playInline used [TsPlaybackManager sharedManager].
+// So stop/onReset/dispose called stopPlayback on the WRONG manager,
+// leaving the shared manager's native view alive on screen.
+// ──────────────────────────────────────────────
+
+- (TsPlaybackManager *)playbackManager {
+    return [TsPlaybackManager sharedManager];
+}
+
 - (void)pluginInitialize {
     [super pluginInitialize];
-    self.playbackManager = [[TsPlaybackManager alloc] init];
+    // No instance creation needed — we use the singleton via -playbackManager
 }
 
 - (void)onReset {
@@ -69,17 +83,6 @@
     }];
 }
 
-- (void)stop:(CDVInvokedUrlCommand *)command {
-    [self.playbackManager stopPlayback];
-    CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:@{ @"status": @"STOPPED" }];
-    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
-}
-
-- (void)cleanup:(CDVInvokedUrlCommand *)command {
-    [self.playbackManager cleanupAllFiles];
-    CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:@{ @"status": @"CLEANED" }];
-    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
-}
 - (void)playInline:(CDVInvokedUrlCommand *)command {
     NSDictionary *options = command.arguments.count ? command.arguments[0] : @{};
     NSString *urlString = options[@"url"];
@@ -97,19 +100,36 @@
     CGFloat height = [frameDict[@"height"] doubleValue];
     CGRect domFrame = CGRectMake(x, y, width, height);
 
+    self.activeCallbackId = command.callbackId;
+
     __weak TsNativePlayerPlugin *weakSelf = self;
-    [[TsPlaybackManager sharedManager] startInlinePlaybackWithURLString:urlString
-                                                               options:options
-                                                             presenter:self.viewController
-                                                               webView:self.webView
-                                                                 frame:domFrame
-                                                                status:^(NSDictionary *payload, BOOL keepCallback) {
+    [self.playbackManager startInlinePlaybackWithURLString:urlString
+                                                   options:options
+                                                 presenter:self.viewController
+                                                   webView:self.webView
+                                                     frame:domFrame
+                                                    status:^(NSDictionary *payload, BOOL keepCallback) {
+        TsNativePlayerPlugin *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.activeCallbackId) {
+            return;
+        }
+
         CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:payload];
         [pluginResult setKeepCallbackAsBool:keepCallback];
-        [weakSelf.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        [strongSelf.commandDelegate sendPluginResult:pluginResult callbackId:strongSelf.activeCallbackId];
+
+        if (!keepCallback) {
+            strongSelf.activeCallbackId = nil;
+        }
     } error:^(NSString *message) {
+        TsNativePlayerPlugin *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf.activeCallbackId) {
+            return;
+        }
+
         CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:message ?: @"Unknown error"];
-        [weakSelf.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+        [strongSelf.commandDelegate sendPluginResult:pluginResult callbackId:strongSelf.activeCallbackId];
+        strongSelf.activeCallbackId = nil;
     }];
 }
 
@@ -127,9 +147,25 @@
     CGFloat height = [frameDict[@"height"] doubleValue];
     CGRect domFrame = CGRectMake(x, y, width, height);
 
-    [[TsPlaybackManager sharedManager] updateInlineFrame:domFrame webView:self.webView];
+    [self.playbackManager updateInlineFrame:domFrame webView:self.webView];
 
     CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+}
+
+- (void)stop:(CDVInvokedUrlCommand *)command {
+    [self.playbackManager stopPlayback];
+    self.activeCallbackId = nil;
+
+    CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:@{ @"status": @"STOPPED" }];
+    [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+}
+
+- (void)cleanup:(CDVInvokedUrlCommand *)command {
+    [self.playbackManager cleanupAllFiles];
+    self.activeCallbackId = nil;
+
+    CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:@{ @"status": @"CLEANED" }];
     [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
 }
 
