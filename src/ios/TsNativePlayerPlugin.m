@@ -1,5 +1,6 @@
 #import "TsNativePlayerPlugin.h"
 #import "TsPlaybackManager.h"
+#import "TsNetworkHelper.h"
 
 @interface TsNativePlayerPlugin ()
 
@@ -11,13 +12,6 @@
 
 // ──────────────────────────────────────────────
 // FIX: Use [TsPlaybackManager sharedManager] everywhere.
-//
-// Previously pluginInitialize created a SEPARATE instance:
-//   self.playbackManager = [[TsPlaybackManager alloc] init];
-//
-// But playInline used [TsPlaybackManager sharedManager].
-// So stop/onReset/dispose called stopPlayback on the WRONG manager,
-// leaving the shared manager's native view alive on screen.
 // ──────────────────────────────────────────────
 
 - (TsPlaybackManager *)playbackManager {
@@ -26,7 +20,6 @@
 
 - (void)pluginInitialize {
     [super pluginInitialize];
-    // No instance creation needed — we use the singleton via -playbackManager
 }
 
 - (void)onReset {
@@ -38,6 +31,40 @@
     [self.playbackManager stopPlayback];
     self.activeCallbackId = nil;
 }
+
+#pragma mark - Warmup (Local Network Permission)
+
+- (void)warmup:(CDVInvokedUrlCommand *)command {
+    /*
+     * Вызывается из JS при старте аппы.
+     * Триггерит системный диалог Local Network Permission
+     * ДО того, как пользователь попробует смотреть видео.
+     *
+     * JS:  TSNativePlayer.warmup({ host: '192.168.0.1', port: 80 }, cb, err)
+     */
+
+    NSDictionary *options = nil;
+    if (command.arguments.count > 0 && [[command.arguments firstObject] isKindOfClass:[NSDictionary class]]) {
+        options = [command.arguments firstObject];
+    }
+
+    NSString *host = [options objectForKey:@"host"] ?: @"192.168.0.1";
+    NSInteger port = [[options objectForKey:@"port"] integerValue];
+    if (port <= 0) port = 80;
+
+    [[TsNetworkHelper sharedHelper] warmupLocalNetworkPermissionWithHost:host
+                                                                   port:(uint16_t)port
+                                                               callback:^(BOOL granted) {
+        NSDictionary *payload = @{
+            @"status": granted ? @"GRANTED" : @"DENIED",
+            @"localNetworkGranted": @(granted)
+        };
+        CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:payload];
+        [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
+    }];
+}
+
+#pragma mark - Play (Fullscreen)
 
 - (void)play:(CDVInvokedUrlCommand *)command {
     NSDictionary *options = nil;
@@ -60,9 +87,7 @@
                                            presenter:self.viewController
                                               status:^(NSDictionary *payload, BOOL keepCallback) {
         TsNativePlayerPlugin *strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.activeCallbackId) {
-            return;
-        }
+        if (!strongSelf || !strongSelf.activeCallbackId) return;
 
         CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:payload];
         [result setKeepCallbackAsBool:keepCallback];
@@ -73,15 +98,15 @@
         }
     } error:^(NSString *message) {
         TsNativePlayerPlugin *strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.activeCallbackId) {
-            return;
-        }
+        if (!strongSelf || !strongSelf.activeCallbackId) return;
 
         CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:message ?: @"Unknown error"];
         [strongSelf.commandDelegate sendPluginResult:result callbackId:strongSelf.activeCallbackId];
         strongSelf.activeCallbackId = nil;
     }];
 }
+
+#pragma mark - Play Inline
 
 - (void)playInline:(CDVInvokedUrlCommand *)command {
     NSDictionary *options = command.arguments.count ? command.arguments[0] : @{};
@@ -110,9 +135,7 @@
                                                      frame:domFrame
                                                     status:^(NSDictionary *payload, BOOL keepCallback) {
         TsNativePlayerPlugin *strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.activeCallbackId) {
-            return;
-        }
+        if (!strongSelf || !strongSelf.activeCallbackId) return;
 
         CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:payload];
         [pluginResult setKeepCallbackAsBool:keepCallback];
@@ -123,15 +146,15 @@
         }
     } error:^(NSString *message) {
         TsNativePlayerPlugin *strongSelf = weakSelf;
-        if (!strongSelf || !strongSelf.activeCallbackId) {
-            return;
-        }
+        if (!strongSelf || !strongSelf.activeCallbackId) return;
 
         CDVPluginResult *pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:message ?: @"Unknown error"];
         [strongSelf.commandDelegate sendPluginResult:pluginResult callbackId:strongSelf.activeCallbackId];
         strongSelf.activeCallbackId = nil;
     }];
 }
+
+#pragma mark - Update Frame
 
 - (void)updateInlineFrame:(CDVInvokedUrlCommand *)command {
     NSDictionary *frameDict = command.arguments.count ? command.arguments[0] : nil;
@@ -152,6 +175,8 @@
     CDVPluginResult *result = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
     [self.commandDelegate sendPluginResult:result callbackId:command.callbackId];
 }
+
+#pragma mark - Stop / Cleanup
 
 - (void)stop:(CDVInvokedUrlCommand *)command {
     [self.playbackManager stopPlayback];

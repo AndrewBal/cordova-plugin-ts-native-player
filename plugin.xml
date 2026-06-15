@@ -2,7 +2,7 @@
 <plugin xmlns="http://apache.org/cordova/ns/plugins/1.0"
         xmlns:ios="http://apple.com/ios/plugins"
         id="cordova-plugin-ts-native-player"
-        version="1.1.0">
+        version="1.2.0">
 
     <name>TSNativePlayer</name>
     <description>Native iOS playback for remote dashcam .TS files using MobileVLCKit and native temp-file download.</description>
@@ -16,6 +16,9 @@
 
     <platform name="ios">
         <framework src="UIKit.framework" />
+        <framework src="Network.framework" />
+        <framework src="SystemConfiguration.framework" />
+
         <podspec>
             <pods>
                 <pod name="MobileVLCKit" />
@@ -25,10 +28,12 @@
         <header-file src="src/ios/TsNativePlayerPlugin.h" />
         <header-file src="src/ios/TsPlaybackManager.h" />
         <header-file src="src/ios/TsPlayerViewController.h" />
+        <header-file src="src/ios/TsNetworkHelper.h" />
 
         <source-file src="src/ios/TsNativePlayerPlugin.m" />
         <source-file src="src/ios/TsPlaybackManager.m" />
         <source-file src="src/ios/TsPlayerViewController.m" />
+        <source-file src="src/ios/TsNetworkHelper.m" />
 
         <config-file target="config.xml" parent="/*">
             <feature name="TsNativePlayer">
@@ -36,6 +41,25 @@
             </feature>
         </config-file>
 
-        
+        <!-- Local Network Permission (iOS 14+) -->
+        <config-file target="*-Info.plist" parent="NSLocalNetworkUsageDescription">
+            <string>This app needs local network access to connect to your dashcam for video playback and file management.</string>
+        </config-file>
+
+        <!-- Bonjour services — required for Local Network permission -->
+        <config-file target="*-Info.plist" parent="NSBonjourServices">
+            <array>
+                <string>_http._tcp</string>
+            </array>
+        </config-file>
+
+        <!-- Allow HTTP (not just HTTPS) for dashcam at 192.168.0.1 -->
+        <config-file target="*-Info.plist" parent="NSAppTransportSecurity">
+            <dict>
+                <key>NSAllowsArbitraryLoads</key>
+                <true/>
+            </dict>
+        </config-file>
+
     </platform>
 </plugin>

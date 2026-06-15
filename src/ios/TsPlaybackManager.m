@@ -1,5 +1,6 @@
 #import "TsPlaybackManager.h"
 #import "TsPlayerViewController.h"
+#import "TsNetworkHelper.h"
 
 #import <MobileVLCKit/MobileVLCKit.h>
 #import <UIKit/UIKit.h>
@@ -105,7 +106,7 @@
 
         self.playerViewController = [[TsPlayerViewController alloc] init];
         [self.playerViewController loadViewIfNeeded];
-        [self.playerViewController setLoadingVisible:YES];
+        // [self.playerViewController setLoadingVisible:YES];
         [self.playerViewController setPlaying:YES];
         [self.playerViewController updatePlaybackTime:@"00:00" duration:@"--:--"];
         [self.playerViewController updateSeekPosition:0.0f];
@@ -286,7 +287,7 @@
 
         self.playerViewController = [[TsPlayerViewController alloc] init];
         self.playerViewController.modalPresentationStyle = UIModalPresentationFullScreen;
-        [self.playerViewController setLoadingVisible:YES];
+        // [self.playerViewController setLoadingVisible:YES];
         [self.playerViewController setPlaying:YES];
         [self.playerViewController updatePlaybackTime:@"00:00" duration:@"--:--"];
         [self.playerViewController updateSeekPosition:0.0f];
@@ -384,7 +385,7 @@
     [self invalidateStartupFallbackTimer];
 
     __weak TsPlaybackManager *weakSelf = self;
-    self.startupFallbackTimer = [NSTimer scheduledTimerWithTimeInterval:4.0
+    self.startupFallbackTimer = [NSTimer scheduledTimerWithTimeInterval:15.0
                                                                 repeats:NO
                                                                   block:^(NSTimer * _Nonnull timer) {
         TsPlaybackManager *strongSelf = weakSelf;
@@ -395,7 +396,7 @@
         strongSelf.didFallbackToDownload = YES;
 
         [strongSelf teardownMediaPlayer];
-        [strongSelf.playerViewController setLoadingVisible:YES];
+        // [strongSelf.playerViewController setLoadingVisible:YES];
 
         [strongSelf sendStatus:@{ @"status": @"FALLBACK_TO_DOWNLOAD" } keepCallback:YES];
 
@@ -420,21 +421,9 @@
         @"url": urlString ?: @""
     } keepCallback:YES];
 
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    config.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    config.URLCache = nil;
-    config.HTTPCookieStorage = nil;
-    config.HTTPShouldSetCookies = NO;
-    config.timeoutIntervalForRequest = 30.0;
-    config.timeoutIntervalForResource = 600.0;
-    config.connectionProxyDictionary = @{};
-    if (@available(iOS 11.0, *)) {
-        config.waitsForConnectivity = NO;
-    }
-    if (@available(iOS 13.0, *)) {
-        config.allowsExpensiveNetworkAccess = YES;
-        config.allowsConstrainedNetworkAccess = YES;
-    }
+    // FIX: WiFi-only session — prevents iOS routing to 5G/LTE
+    // when the dashcam is on local WiFi (192.168.0.1)
+    NSURLSessionConfiguration *config = [TsNetworkHelper wifiOnlyEphemeralConfiguration];
 
     self.session = [NSURLSession sessionWithConfiguration:config
                                                  delegate:nil
@@ -489,7 +478,13 @@
             @"localPath": targetPath
         } keepCallback:YES];
 
-        [strongSelf presentPlayerForLocalFilePath:targetPath presenter:presenter];
+        // FIX: If we're in inline mode, reuse existing inline player view
+        // instead of creating a new fullscreen modal
+        if (strongSelf.isInlineMode && strongSelf.playerViewController) {
+            [strongSelf replayInlineWithLocalFile:targetPath];
+        } else {
+            [strongSelf presentPlayerForLocalFilePath:targetPath presenter:presenter];
+        }
     }];
 
     [self.downloadTask resume];
@@ -746,6 +741,43 @@
 
 #pragma mark - Local File Player
 
+// FIX: Replay in existing inline player with downloaded local file.
+// Called when fallback fires during inline mode — reuses the existing
+// playerViewController instead of creating a new fullscreen modal.
+- (void)replayInlineWithLocalFile:(NSString *)filePath {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.playerViewController || self.isStopping) {
+            [self sendError:@"Inline player unavailable for local file replay"];
+            return;
+        }
+
+        // Tear down old VLC if still alive
+        [self teardownMediaPlayer];
+
+        // [self.playerViewController setLoadingVisible:YES];
+        [self.playerViewController setPlaying:YES];
+        [self.playerViewController updatePlaybackTime:@"00:00" duration:@"--:--"];
+        [self.playerViewController updateSeekPosition:0.0f];
+
+        // Create new VLC player and attach to existing inline view
+        self.mediaPlayer = [[VLCMediaPlayer alloc] init];
+        self.mediaPlayer.delegate = self;
+        self.mediaPlayer.drawable = [self.playerViewController videoContainerView];
+
+        NSURL *localURL = [NSURL fileURLWithPath:filePath];
+        VLCMedia *media = [VLCMedia mediaWithURL:localURL];
+        self.mediaPlayer.media = media;
+
+        [self sendStatus:@{
+            @"status": @"OPENING",
+            @"inline": @YES,
+            @"localPath": filePath
+        } keepCallback:YES];
+
+        [self.mediaPlayer play];
+    });
+}
+
 - (void)presentPlayerForLocalFilePath:(NSString *)filePath presenter:(UIViewController *)presenter {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *topPresenter = [self topMostPresenterFrom:presenter];
@@ -756,7 +788,7 @@
 
         self.playerViewController = [[TsPlayerViewController alloc] init];
         self.playerViewController.modalPresentationStyle = UIModalPresentationFullScreen;
-        [self.playerViewController setLoadingVisible:YES];
+        // [self.playerViewController setLoadingVisible:YES];
         [self.playerViewController setPlaying:YES];
         [self.playerViewController updatePlaybackTime:@"00:00" duration:@"--:--"];
         [self.playerViewController updateSeekPosition:0.0f];
@@ -899,27 +931,29 @@
 
         switch (self.mediaPlayer.state) {
             case VLCMediaPlayerStateOpening:
-                [self.playerViewController setLoadingVisible:!self.hasStartedPlayback];
+                // [self.playerViewController setLoadingVisible:!self.hasStartedPlayback];
                 [self.playerViewController setPlaying:YES];
                 [self sendStatus:@{ @"status": @"OPENING" } keepCallback:YES];
                 break;
 
             case VLCMediaPlayerStateBuffering:
-                [self.playerViewController setLoadingVisible:!self.hasStartedPlayback];
+                // FIX: If VLC is buffering, it connected successfully — cancel fallback
+                [self invalidateStartupFallbackTimer];
+                // [self.playerViewController setLoadingVisible:!self.hasStartedPlayback];
                 [self sendStatus:@{ @"status": @"BUFFERING" } keepCallback:YES];
                 break;
 
             case VLCMediaPlayerStatePlaying:
                 self.hasStartedPlayback = YES;
                 [self invalidateStartupFallbackTimer];
-                [self.playerViewController setLoadingVisible:NO];
+                // [self.playerViewController setLoadingVisible:NO];
                 [self.playerViewController setPlaying:YES];
                 [self.playerViewController restartAutoHideTimer];
                 [self sendStatus:@{ @"status": @"PLAYING" } keepCallback:YES];
                 break;
 
             case VLCMediaPlayerStatePaused:
-                [self.playerViewController setLoadingVisible:NO];
+                // [self.playerViewController setLoadingVisible:NO];
                 [self.playerViewController setPlaying:NO];
                 [self.playerViewController setControlsHidden:NO animated:YES];
                 [self.playerViewController invalidateAutoHideTimer];
@@ -927,7 +961,7 @@
                 break;
 
             case VLCMediaPlayerStateEnded:
-                [self.playerViewController setLoadingVisible:NO];
+                // [self.playerViewController setLoadingVisible:NO];
                 [self sendStatus:@{ @"status": @"FINISHED" } keepCallback:YES];
                 [self stopPlayback];
                 break;
@@ -938,7 +972,7 @@
             }
 
             case VLCMediaPlayerStateStopped:
-                [self.playerViewController setLoadingVisible:NO];
+                // [self.playerViewController setLoadingVisible:NO];
                 if (!self.isStopping) {
                     [self sendStatus:@{ @"status": @"STOPPED" } keepCallback:YES];
                 }
@@ -951,8 +985,6 @@
 }
 
 - (void)playerFailedBeforeStartMaybeFallback {
-    [self.playerViewController setLoadingVisible:NO];
-
     if (!self.hasStartedPlayback && !self.didFallbackToDownload && self.currentRemoteURLString.length) {
         self.didFallbackToDownload = YES;
 
@@ -961,6 +993,9 @@
 
         [self teardownMediaPlayer];
 
+        // Keep spinner visible while downloading
+        // [self.playerViewController setLoadingVisible:YES];
+
         [self sendStatus:@{ @"status": @"FALLBACK_TO_DOWNLOAD" } keepCallback:YES];
         [self startDownloadPlaybackFromRemoteURL:remoteURL
                                        presenter:presenter
@@ -968,6 +1003,7 @@
         return;
     }
 
+    // [self.playerViewController setLoadingVisible:NO];
     NSString *stateName = VLCMediaPlayerStateToString(self.mediaPlayer.state) ?: @"Error";
     [self sendError:[NSString stringWithFormat:@"VLC playback failed: %@", stateName]];
 }
