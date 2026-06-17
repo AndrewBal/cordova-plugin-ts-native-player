@@ -1,0 +1,14 @@
+// Gradle dependencies for the Android side of cordova-plugin-ts-native-player.
+// Uses libVLC for Android — the same engine MobileVLCKit provides on iOS —
+// so remote dashcam .TS streams play directly without an ffmpeg remux step.
+
+repositories {
+    mavenCentral()
+    google()
+}
+
+dependencies {
+    // Full libVLC AAR (includes org.videolan.libvlc.util.VLCVideoLayout).
+    // Pinned to the version already used by cordova-plugin-rtsp-player.
+    implementation 'org.videolan.android:libvlc-all:3.6.0'
+}
